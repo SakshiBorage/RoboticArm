@@ -1,20 +1,25 @@
 """
-Live, watchable demo of the Tier 1 pipeline.
+Live, watchable demo of the Tier 1 pipeline — framed as a real pick-and-place
+task instead of arbitrary joint moves, so the fault and recovery mean something.
 
 Open http://localhost:6080/vnc.html in a browser BEFORE running this, so you
 can watch the arm on the pendant's 3D view while it runs.
 
+The task: pick up a part at Station A, carry it to Station B, place it down.
+
 What happens, in order:
-  1. Powers on and sends a visible move.
-  2. Sends a second move, and partway through it, fires a real overspeed
-     fault on purpose (this is the "something goes wrong mid-motion" part).
+  1. Powers on, moves to Station A, and picks up the part.
+  2. Starts carrying the part toward Station B — and partway through that
+     carry, fires a real overspeed fault on purpose (the "something goes
+     wrong mid-task" part).
   3. service.py's monitor loop is polling the whole time — it detects the
      fault, Tier 1 kicks in, the Guard checks it, and clear_protective_stop()
      is executed automatically. No human step.
-  4. The instant that recovery executes, sends a clearly visible
-     "post-recovery" move — proof the arm is actually back to work, not
-     just that a status flag flipped to NORMAL.
-  5. Prints the final status once it's back to NORMAL.
+  4. The instant that recovery executes, the arm RESUMES the interrupted
+     task — finishes carrying the part to Station B and places it down.
+     That's the actual proof it's working again, not just a status flag.
+  5. Prints the final status once the task is complete and the arm is back
+     at NORMAL.
 
 Run with: python3 demo.py
 """
@@ -25,10 +30,16 @@ import time
 from service import Service
 from ursim_controller import URSimController
 
+HOME = [0, -1.57, 0, -1.57, 0, 0]
+ABOVE_STATION_A = [-0.5, -1.2, 1.3, -1.6, -1.5, 0]
+AT_STATION_A = [-0.5, -1.0, 1.5, -2.0, -1.5, 0]
+ABOVE_STATION_B = [0.9, -1.2, 1.3, -1.6, -1.5, 0]
+AT_STATION_B = [0.9, -1.0, 1.5, -2.0, -1.5, 0]
+
 
 def trigger_fault_after(delay):
     time.sleep(delay)
-    print(f"\n>>> Triggering a real overspeed fault mid-motion...\n")
+    print("\n>>> Something goes wrong mid-carry — triggering a real overspeed fault...\n")
     script = """
 def unsafe_speed():
   speedj([10, 10, 10, 10, 10, 10], a=40, t=3)
@@ -39,15 +50,23 @@ unsafe_speed()
         s.sendall(script.encode())
 
 
-def confirm_recovery(controller):
-    """Proves the arm is actually usable again after a Tier 1 fix — not just that
-    safetystatus says NORMAL, but that it will accept and run a real move again."""
+def resume_task(controller):
+    """Proves the arm is actually usable again after a Tier 1 fix by finishing
+    the job it was interrupted mid-way through, not just moving for the sake of it."""
     time.sleep(1)
-    print(">>> Recovery executed — confirming the arm actually works: sending a move...\n")
-    controller.move_joints([0, -1.2, 1.2, -1.5, -1.5, 0], a=0.3, v=0.2)
+    print(">>> Recovered — resuming the task: carrying the part the rest of the way to Station B...\n")
+    controller.move_joints(ABOVE_STATION_B, a=0.3, v=0.2)
+    time.sleep(2.5)
+
+    print(">>> Placing the part down at Station B...\n")
+    controller.move_joints(AT_STATION_B, a=0.3, v=0.2)
     time.sleep(2)
-    controller.move_joints([0.5, -0.9, 0.9, -1.6, -1.0, 0.3], a=0.3, v=0.2)
-    print(">>> Post-recovery moves sent — watch the pendant, the arm is working normally again.\n")
+
+    print(">>> Part placed. Retreating and returning home...\n")
+    controller.move_joints(ABOVE_STATION_B, a=0.3, v=0.2)
+    time.sleep(1.5)
+    controller.move_joints(HOME, a=0.3, v=0.2)
+    print(">>> Task complete — pick-and-place finished despite the mid-task fault.\n")
 
 
 def make_report(controller):
@@ -56,7 +75,7 @@ def make_report(controller):
               f"proposed_op={result.proposal.op}  decision={result.decision}  "
               f"executed={result.executed}")
         if result.decision == "APPROVED" and result.executed:
-            threading.Thread(target=confirm_recovery, args=(controller,)).start()
+            threading.Thread(target=resume_task, args=(controller,)).start()
     return report
 
 
@@ -67,12 +86,20 @@ def main():
     controller.power_on()
     print("Status:", controller.get_status())
 
-    print("\nSending a visible move — watch the pendant now.")
-    controller.move_joints([0, -1.57, 0, -1.57, 0, 0], a=0.3, v=0.2)
+    print("\nMoving to Station A to pick up the part — watch the pendant now.")
+    controller.move_joints(ABOVE_STATION_A, a=0.3, v=0.2)
     time.sleep(2.5)
 
-    print("Sending a second move...")
-    controller.move_joints([1.57, -0.8, 1.4, -1.9, -1.2, 0.8], a=0.3, v=0.2)
+    print("Picking up the part at Station A...")
+    controller.move_joints(AT_STATION_A, a=0.3, v=0.2)
+    time.sleep(2)
+
+    print("Lifting the part off Station A...")
+    controller.move_joints(ABOVE_STATION_A, a=0.3, v=0.2)
+    time.sleep(2)
+
+    print("Carrying the part toward Station B...")
+    controller.move_joints(ABOVE_STATION_B, a=0.3, v=0.2)
 
     threading.Thread(target=trigger_fault_after, args=(1.5,)).start()
 
