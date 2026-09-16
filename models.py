@@ -14,6 +14,7 @@ class Fault:
 class Proposal:
     op: str
     params: dict = field(default_factory=dict)
+    reasoning: str = ""  # set by AgentProposer; empty for deterministic proposers
 
 
 @dataclass
@@ -29,5 +30,7 @@ class CycleResult:
     tier: int
     proposal: Proposal
     gate_results: list
-    decision: str          # "APPROVED" | "DENIED" | "AWAITING_APPROVAL"
+    decision: str          # "APPROVED" | "DENIED" — Tier 2 blocks on approval() before this is set,
+                           # so there's no separate "awaiting" state to represent
     executed: bool
+    execution_error: str = None  # set if decision was APPROVED but _execute() raised

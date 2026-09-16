@@ -24,6 +24,13 @@ class SafetyMonitor:
     def _is_normal(self, status):
         return "NORMAL" in status["safetystatus"]
 
+    def fault_duration_seconds(self):
+        """How long the current fault has been ongoing, or None if not in a fault
+        right now. Lets a proposer distinguish "just happened" from "still stuck"."""
+        if self._state != "FAULT" or self._fault_started_at is None:
+            return None
+        return time.monotonic() - self._fault_started_at
+
     def poll_once(self):
         try:
             status = self.controller.get_status()

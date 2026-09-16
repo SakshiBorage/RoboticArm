@@ -50,11 +50,28 @@ SCENARIOS = [
         "expect": {"tier": 1, "decision": "DENIED", "executed": False},
     },
     {
-        "name": "unknown fault type -> Tier 2 -> AWAITING_APPROVAL, no execution",
+        "name": "unknown fault type -> Tier 2 escalate -> DENIED (no controller method), no execution",
         "controller_state": ("UNDEFINED_SAFETY_MODE", "RUNNING"),
         "fault": make_fault("UNDEFINED_SAFETY_MODE", "UNDEFINED_SAFETY_MODE", "RUNNING"),
         "proposer": ScriptedProposer([Proposal(op="escalate", params={})]),
-        "expect": {"tier": 2, "decision": "AWAITING_APPROVAL", "executed": False},
+        "approval": lambda fault, proposal: True,
+        "expect": {"tier": 2, "decision": "DENIED", "executed": False},
+    },
+    {
+        "name": "Tier 2 real op + human approves -> APPROVED + executed",
+        "controller_state": ("UNDEFINED_SAFETY_MODE", "RUNNING"),
+        "fault": make_fault("UNDEFINED_SAFETY_MODE", "UNDEFINED_SAFETY_MODE", "RUNNING"),
+        "proposer": ScriptedProposer([Proposal(op="emergency_stop", params={})]),
+        "approval": lambda fault, proposal: True,
+        "expect": {"tier": 2, "decision": "APPROVED", "executed": True},
+    },
+    {
+        "name": "Tier 2 real op + human denies -> DENIED, no execution",
+        "controller_state": ("UNDEFINED_SAFETY_MODE", "RUNNING"),
+        "fault": make_fault("UNDEFINED_SAFETY_MODE", "UNDEFINED_SAFETY_MODE", "RUNNING"),
+        "proposer": ScriptedProposer([Proposal(op="emergency_stop", params={})]),
+        "approval": lambda fault, proposal: False,
+        "expect": {"tier": 2, "decision": "DENIED", "executed": False},
     },
 ]
 
@@ -64,8 +81,11 @@ def run_scenarios():
     for scenario in SCENARIOS:
         safetystatus, robotmode = scenario["controller_state"]
         controller = FakeControllerAdapter(safetystatus=safetystatus, robotmode=robotmode)
+        # Tier 1 scenarios never call approval(); default it anyway so nothing
+        # can block on input() if a scenario forgets to set one.
+        approval = scenario.get("approval", lambda fault, proposal: False)
         service = Service(controller=controller, proposer=scenario["proposer"],
-                           audit=_NullAuditLog())
+                           audit=_NullAuditLog(), approval=approval)
 
         result = service.run_cycle(scenario["fault"])
         actual = {"tier": result.tier, "decision": result.decision, "executed": result.executed}
