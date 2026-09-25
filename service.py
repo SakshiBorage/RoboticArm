@@ -21,6 +21,17 @@ logger = get_logger(__name__)
 
 SAFETYSTATUS_RE = re.compile(r"Safetystatus:\s*(\w+)")
 
+# Plain-language descriptions for the pendant notification — someone watching
+# the arm with no other context shouldn't have to know what "clear_protective_stop" means.
+OP_PLAIN_LANGUAGE = {
+    "clear_protective_stop": "cleared the safety stop",
+    "reset_program_pointer": "restarted the program",
+    "move_joints": "repositioned the arm",
+    "set_payload": "updated the payload setting",
+    "emergency_stop": "stopped the arm immediately",
+    "escalate": "flagged this for a person to review",
+}
+
 
 def fault_from_status(status: dict) -> Fault:
     match = SAFETYSTATUS_RE.search(status["safetystatus"])
@@ -54,6 +65,34 @@ class Service:
 
     def _execute(self, proposal):
         return getattr(self.controller, proposal.op)(**proposal.params)
+
+    def _notify_safe(self, message):
+        """Show a message on the pendant for whoever's watching the sim/hardware directly
+        — best-effort, since a failed notification shouldn't take down a real cycle."""
+        try:
+            self.controller.notify(message)
+        except Exception:
+            logger.exception(f"notify() failed for message: {message}")
+
+    def _notify_outcome(self, result: CycleResult):
+        """Fires once, right when the real outcome is known — never before, so the
+        message on the pendant is always synced to something that actually happened,
+        not a "we're thinking about it" placeholder. Plain language, no internal
+        jargon (no "Tier", "gate", op names) — written for someone with zero other
+        context, just watching the arm."""
+        fault_label = result.fault.fault_type.replace("_", " ").title()
+        op_label = OP_PLAIN_LANGUAGE.get(result.proposal.op, result.proposal.op)
+
+        if result.decision == "APPROVED" and result.executed:
+            message = f"{fault_label} happened — fixed automatically: {op_label}. No action needed."
+        elif result.decision == "APPROVED" and result.execution_error:
+            message = (f"{fault_label} happened — tried to fix it ({op_label}) but that failed: "
+                       f"{result.execution_error}. A person needs to check this.")
+        else:  # DENIED
+            failed = next((g for g in result.gate_results if not g["passed"]), None)
+            reason = failed["reason"] if failed else "unclear reason"
+            message = f"{fault_label} happened — proposed fix was rejected ({reason}). A person needs to check this."
+        self._notify_safe(message)
 
     def run_cycle(self, fault: Fault) -> CycleResult:
         tier = self.router.assign_tier(fault)
@@ -97,6 +136,7 @@ class Service:
         if execution_error:
             audit_entry["execution_error"] = execution_error
         self.audit.record(audit_entry)
+        self._notify_outcome(result)
         return result
 
     def run(self, cycles: int, on_cycle=None, on_event=None):

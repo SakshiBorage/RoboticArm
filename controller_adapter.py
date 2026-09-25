@@ -38,3 +38,8 @@ class ControllerAdapter(ABC):
     @abstractmethod
     def emergency_stop(self) -> bool:
         """Immediately halt whatever program is running."""
+
+    @abstractmethod
+    def notify(self, message: str) -> bool:
+        """Show a message where someone watching the physical/simulated pendant can see
+        it — no safety effect, purely informational (fault detected, fix applied, etc.)."""

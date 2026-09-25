@@ -1,0 +1,37 @@
+{
+    "name": "factory_arm_agent",
+    "version": "1.0.0",
+    "description": "Tier 2 escalation agent for the factory robot arm project. Given a fault that isn't on the Tier 1 auto-recovery whitelist, assesses whether it can be confidently handled and, if so, proposes one action from a declared catalog via OpenAI. Posts the proposal to Slack and waits for a reply before returning; a rejection retries once with that feedback folded in, then escalates. Never executes anything itself — the calling system's own Guard independently re-verifies and executes whatever this agent returns.",
+    "config": {
+        "triggers": [
+            {
+                "name": "fault",
+                "type": "dict",
+                "required": true,
+                "description": "The fault as detected: {fault_type, safetystatus, robotmode}.",
+                "friendly_name": "Fault"
+            },
+            {
+                "name": "live_status",
+                "type": "dict",
+                "required": false,
+                "description": "A freshly re-checked live status snapshot: {safetystatus, robotmode}. Omit if not available.",
+                "friendly_name": "Live Status"
+            },
+            {
+                "name": "fault_duration_seconds",
+                "type": "int",
+                "required": false,
+                "description": "How long the fault has been ongoing, in seconds, per the safety monitor. Omit if not yet known.",
+                "friendly_name": "Fault Duration (s)"
+            },
+            {
+                "name": "recent_history",
+                "type": "list",
+                "required": false,
+                "description": "Last few audit log entries for this same fault_type, so the agent can see whether this was already tried and what happened.",
+                "friendly_name": "Recent History"
+            }
+        ]
+    }
+}

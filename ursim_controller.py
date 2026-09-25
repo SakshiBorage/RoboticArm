@@ -83,3 +83,10 @@ controller_set_payload()
     def emergency_stop(self):
         reply = self._dashboard_command("stop")[0]
         return "fail" not in reply.lower()
+
+    def notify(self, message):
+        # `popup` shows a message box directly on the pendant screen; `addToLog`
+        # also writes it into URSim's own Log tab so it's there after the popup
+        # is dismissed. Neither has any effect on the robot's actual state.
+        replies = self._dashboard_command(f"popup {message}", f"addToLog {message}")
+        return all("fail" not in r.lower() for r in replies)

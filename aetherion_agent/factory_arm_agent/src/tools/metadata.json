@@ -1,0 +1,6 @@
+{
+    "name": "factory_arm_agent ",
+    "version": "1.0.0",
+    "description": "propose_fix — the only real I/O: a direct OpenAI call that assesses a fault and, if handleable, proposes one action from a declared catalog.",
+    "config": {}
+}

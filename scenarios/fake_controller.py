@@ -47,3 +47,7 @@ class FakeControllerAdapter(ControllerAdapter):
     def emergency_stop(self):
         self.calls.append(("emergency_stop", {}))
         return True
+
+    def notify(self, message):
+        self.calls.append(("notify", {"message": message}))
+        return True
