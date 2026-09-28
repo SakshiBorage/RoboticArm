@@ -15,7 +15,12 @@ it at Station B — and something goes wrong at a different stage each time:
      proposes a fix (typically set_payload) -> YOU approve/reject it in Slack
      -> Guard re-checks -> it runs or doesn't.
      (TIER2_BACKEND=local instead: direct LLM call + terminal y/N prompt)
-  4. Tier 3 — critical fault while picking up the object (REAL controller
+  4. Tier 2 again, reject-then-retry — payload mismatch right after lifting
+     (SIMULATED), but this time the gripper's reading is wrong -> YOU reject
+     the first proposal in Slack with the real weight as feedback -> the agent
+     retries once with that feedback -> YOU approve the revised fix -> Guard
+     re-checks -> it runs.
+  5. Tier 3 — critical fault while picking up the object (REAL controller
      FAULT; the arm powers itself off) -> halted, nothing fixed automatically,
      a person is alerted in Slack -> YOU confirm at the terminal that the arm
      was inspected -> safety is restarted and the job finishes.
@@ -32,10 +37,12 @@ logs/<timestamp>_demo/ folder — see run_logs.py.
 Open http://localhost:6080/vnc.html in a browser BEFORE running this, so you
 can watch the arm on the pendant's 3D view while it runs.
 
-Run with: python3 demo.py
+Run with: python3 demo.py            (all scenes)
+      or: python3 demo.py 3 4        (only the listed scene numbers, as printed)
 """
 import contextlib
 import socket
+import sys
 import threading
 import time
 
@@ -287,7 +294,50 @@ def scenario_tier2_payload_mismatch(controller, service, preventive, run_log):
     finish_task_message()
 
 
-# --- Scene 4: Tier 3 — real critical fault while picking up --------------------
+# --- Scene 4: Tier 2 — reject, the agent retries with your feedback, approve ---
+
+GRIPPER_READING_KG = 2.4
+WORK_ORDER_KG = 1.5
+REJECTION_FEEDBACK = (f"No - the gripper's load sensor is out of calibration. The part weighs "
+                      f"{WORK_ORDER_KG} kg per the work order. Set the payload to {WORK_ORDER_KG} kg.")
+
+
+def scenario_tier2_reject_then_retry(controller, service, preventive, run_log):
+    run_steps(controller, [0, 1, 2])
+
+    print(f">>> [SIMULATED — not from real hardware] Right after lifting, the gripper reports "
+          f"{GRIPPER_READING_KG} kg, but the")
+    print(">>> configured payload is 0 kg. This time the gripper's reading is WRONG, and only you know it.")
+    print(">>> The agent will post a first proposal in Slack. REJECT it by replying in the channel with:\n")
+    print(f"      {REJECTION_FEEDBACK}\n")
+    print(">>> The agent retries once with your reply as feedback and posts a new proposal.")
+    print(">>> If it now uses the right weight, reply \"approve\".\n")
+    fault = Fault(
+        fault_type="PAYLOAD_MISMATCH",
+        safetystatus=(f"Safetystatus: PAYLOAD_MISMATCH (SIMULATED) - gripper reports "
+                      f"{GRIPPER_READING_KG} kg held, configured payload is 0.0 kg"),
+        robotmode="Robotmode: RUNNING",
+        detected_at=time.time(),
+    )
+    with controller.simulate_status({"safetystatus": fault.safetystatus, "robotmode": fault.robotmode}):
+        result = service.run_cycle(fault)
+    print()
+    print_cycle_result(result)
+    if result.executed and result.proposal.op == "set_payload":
+        print(f">>> The approved retry ran: payload is now {result.proposal.params.get('mass_kg')} kg "
+              f"(the gripper said {GRIPPER_READING_KG} kg).")
+    hold_for_pendant()
+    print()
+
+    run_steps(controller, [3, 4, 5])
+    if result.executed and result.proposal.op == "set_payload":
+        print(">>> Object released — setting the payload back to 0 kg.")
+        controller.set_payload(0.0)
+    run_steps(controller, [6])
+    finish_task_message()
+
+
+# --- Scene 5: Tier 3 — real critical fault while picking up --------------------
 
 def scenario_tier3_critical_during_pickup(controller, service, preventive, run_log):
     run_steps(controller, [0])
@@ -337,12 +387,15 @@ SCENES = [
      scenario_tier1_fault_during_carry),
     ("Tier 2 — payload mismatch while placing the object (SIMULATED) — Aetherion agent + your Slack approval",
      scenario_tier2_payload_mismatch),
+    ("Tier 2 — reject, retry with your feedback, approve (SIMULATED payload mismatch)",
+     scenario_tier2_reject_then_retry),
     ("Tier 3 — critical fault while picking up the object (real) — halted, a person restarts it",
      scenario_tier3_critical_during_pickup),
 ]
 
 
 def main():
+    wanted = {int(a) for a in sys.argv[1:]}
     run_log = RunLog("demo")
     print(f"Logs for this run: {run_log.dir}\n")
 
@@ -358,6 +411,8 @@ def main():
                                    on_warning=on_warning, on_clear=on_clear).start()
     try:
         for i, (name, scene_fn) in enumerate(SCENES, start=1):
+            if wanted and i not in wanted:
+                continue
             print(f"\n{'=' * 70}")
             print(f"Scene {i}/{len(SCENES)}: {name}")
             print(f"{'=' * 70}\n")

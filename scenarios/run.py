@@ -112,6 +112,15 @@ SCENARIOS = [
         "expect": {"tier": 2, "decision": "APPROVED", "executed": True},
     },
     {
+        "name": "Aetherion agent: rejected once, retried with feedback, approved -> APPROVED + executed",
+        "controller_state": ("UNDEFINED_SAFETY_MODE", "RUNNING"),
+        "fault": make_fault("PAYLOAD_MISMATCH", "PAYLOAD_MISMATCH", "RUNNING"),
+        **aetherion_scenario(completed_run(
+            {"status": "approved",
+             "proposal": {"op": "set_payload", "params": {"mass_kg": 1.5}, "reasoning": "per work order"}})),
+        "expect": {"tier": 2, "decision": "APPROVED", "executed": True},
+    },
+    {
         "name": "Aetherion agent: rejected twice in Slack -> escalate -> DENIED, no execution",
         "controller_state": ("UNDEFINED_SAFETY_MODE", "RUNNING"),
         "fault": make_fault("UNDEFINED_SAFETY_MODE", "UNDEFINED_SAFETY_MODE", "RUNNING"),
