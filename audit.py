@@ -5,13 +5,15 @@ import time
 
 
 class AuditLog:
-    def __init__(self, path="audit_log.jsonl"):
+    def __init__(self, path="audit_log.jsonl", copy_to=None):
         self.path = path
+        self.copy_to = copy_to  # per-run audit file (run_logs.RunLog.audit_path), if any
 
     def record(self, entry: dict):
         entry = {"timestamp": time.time(), **entry}
-        with open(self.path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        for path in filter(None, (self.path, self.copy_to)):
+            with open(path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
         return entry
 
     def read_recent(self, n=5, fault_type=None):

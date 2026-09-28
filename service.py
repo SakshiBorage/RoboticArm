@@ -1,5 +1,7 @@
 """
 Orchestrates one full cycle: fault -> tier -> proposal -> guard -> execute -> audit.
+Tier 3 (critical) skips the proposer entirely: the only proposal is to halt, and
+a person is alerted in Slack to inspect and restart the arm.
 Wired against the real URSimController + SafetyMonitor by default; scenarios/
 inject a FakeControllerAdapter instead so tests don't touch real hardware.
 """
@@ -7,14 +9,17 @@ import argparse
 import re
 import time
 
+from alerts import send_slack
 from app_logging import get_logger
 from approval import cli_approval
 from audit import AuditLog
 from guard import Guard
-from models import Fault, CycleResult
+from models import Fault, CycleResult, Proposal
 from monitor import SafetyMonitor
+from preventive import PreventiveMonitor, make_alert_handlers
 from proposer import CompositeProposer
 from router import Router
+from run_logs import RunLog
 from ursim_controller import URSimController
 
 logger = get_logger(__name__)
@@ -46,7 +51,7 @@ def fault_from_status(status: dict) -> Fault:
 
 class Service:
     def __init__(self, controller=None, monitor=None, router=None, proposer=None,
-                 guard=None, audit=None, approval=None):
+                 guard=None, audit=None, approval=None, alerter=None):
         self.controller = controller or URSimController()
         self.monitor = monitor or SafetyMonitor(controller=self.controller)
         self.router = router or Router()
@@ -61,7 +66,12 @@ class Service:
             if tier2.audit is None:
                 tier2.audit = self.audit
         self.guard = guard or Guard()
-        self.approval = approval or cli_approval
+        # A Tier 2 proposer that collects its own human approval (the Aetherion agent,
+        # via Slack) supplies the approval hook; otherwise ask at the terminal.
+        tier2_approval = getattr(getattr(self.proposer, "tier2_proposer", None), "approval", None)
+        self.approval = approval or tier2_approval or cli_approval
+        # Tier 3 alerts go straight to a person (Slack); scenarios pass a no-op.
+        self.alerter = alerter or send_slack
 
     def _execute(self, proposal):
         return getattr(self.controller, proposal.op)(**proposal.params)
@@ -83,8 +93,16 @@ class Service:
         fault_label = result.fault.fault_type.replace("_", " ").title()
         op_label = OP_PLAIN_LANGUAGE.get(result.proposal.op, result.proposal.op)
 
-        if result.decision == "APPROVED" and result.executed:
-            message = f"{fault_label} happened — fixed automatically: {op_label}. No action needed."
+        if result.tier == 3:
+            halted = "The arm has been stopped" if result.executed else "Stopping the arm FAILED — stop it manually"
+            message = (f"CRITICAL: {fault_label} ({result.fault.safetystatus}). {halted}. Nothing was fixed "
+                       f"automatically — a person must inspect the arm before it is restarted.")
+        elif result.proposal.op == "escalate":
+            message = (f"{fault_label} happened — no fix was applied; a person needs to check this. "
+                       f"Why: {_shorten(result.proposal.reasoning or 'no safe automatic fix was found')}")
+        elif result.decision == "APPROVED" and result.executed:
+            how = "fixed after a person approved it" if result.tier == 2 else "fixed automatically"
+            message = f"{fault_label} happened — {how}: {op_label}. No action needed."
         elif result.decision == "APPROVED" and result.execution_error:
             message = (f"{fault_label} happened — tried to fix it ({op_label}) but that failed: "
                        f"{result.execution_error}. A person needs to check this.")
@@ -94,9 +112,25 @@ class Service:
             message = f"{fault_label} happened — proposed fix was rejected ({reason}). A person needs to check this."
         self._notify_safe(message)
 
+    def _alert_tier3(self, result: CycleResult):
+        halted = "Arm halted." if result.executed else "Halting the arm FAILED — stop it manually now."
+        text = (f":rotating_light: *CRITICAL fault — Tier 3* :rotating_light:\n"
+                f"Fault: {result.fault.fault_type} ({result.fault.safetystatus}, {result.fault.robotmode})\n"
+                f"{halted} Nothing was fixed automatically.\n"
+                f"A person must inspect the arm on site before it is restarted.")
+        try:
+            return self.alerter(text)
+        except Exception:
+            logger.exception("Tier 3 alert failed")
+            return False
+
     def run_cycle(self, fault: Fault) -> CycleResult:
         tier = self.router.assign_tier(fault)
-        proposal = self.proposer.propose(fault, tier)
+        if tier == 3:
+            proposal = Proposal(op="emergency_stop", params={},
+                                reasoning="critical fault: halt and wait for a person; no automatic recovery")
+        else:
+            proposal = self.proposer.propose(fault, tier)
 
         approved_by_human = True
         if tier == 2:
@@ -135,6 +169,10 @@ class Service:
         }
         if execution_error:
             audit_entry["execution_error"] = execution_error
+        if proposal.agent_run_id:
+            audit_entry["agent_run_id"] = proposal.agent_run_id
+        if tier == 3:
+            audit_entry["human_alerted"] = self._alert_tier3(result)
         self.audit.record(audit_entry)
         self._notify_outcome(result)
         return result
@@ -165,15 +203,29 @@ class Service:
         return results
 
 
+def _shorten(text, limit=160):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--cycles", type=int, default=60)
+    run_parser.add_argument("--preventive-interval", type=float, default=5.0,
+                            help="seconds between preventive health checks (0 to turn them off)")
     args = parser.parse_args()
 
     if args.command == "run":
-        service = Service()
+        run_log = RunLog("service")
+        controller = URSimController()
+        service = Service(controller=controller, audit=AuditLog(copy_to=run_log.audit_path))
+        print(f"Logs for this run: {run_log.dir}")
+        preventive = None
+        if args.preventive_interval > 0:
+            on_warning, on_clear = make_alert_handlers(controller, run_log)
+            preventive = PreventiveMonitor(interval_s=args.preventive_interval,
+                                           on_warning=on_warning, on_clear=on_clear).start()
 
         def report(result):
             print(f"[{result.tier=} {result.proposal.op=} {result.decision=} {result.executed=}]")
@@ -186,8 +238,13 @@ def main():
 
         def report_event(event_type, data):
             print(f"[EVENT {event_type}] {data}")
+            run_log.event(event_type.lower(), **data)
 
-        service.run(cycles=args.cycles, on_cycle=report, on_event=report_event)
+        try:
+            service.run(cycles=args.cycles, on_cycle=report, on_event=report_event)
+        finally:
+            if preventive:
+                preventive.stop()
 
 
 if __name__ == "__main__":

@@ -179,13 +179,107 @@ class AgentProposer:
         return Proposal(op=op, params=params, reasoning=parsed["reasoning"])
 
 
+class AetherionProposer:
+    """Tier 2 proposer backed by the factory_arm_agent published on Aetherion sbox.
+    The agent does the LLM proposal AND the human approval (Slack, with one retry on
+    rejection), so this blocks until that run finishes. Only an agent run that ends
+    "approved" counts as human approval — approval() reports it for Guard's
+    tier2_approval gate, and Guard still re-verifies live state before anything runs."""
+
+    def __init__(self, controller=None, monitor=None, audit=None, client=None, wait_seconds=None):
+        self.controller = controller
+        self.monitor = monitor
+        self.audit = audit
+        if client is None:
+            import aetherion_client as client
+        self.client = client
+        self.wait_seconds = wait_seconds or int(os.environ.get("AETHERION_TIER2_WAIT_SECONDS", "900"))
+        self._approved_proposal = None
+
+    def propose(self, fault, tier) -> Proposal:
+        self._approved_proposal = None
+        self._run_id = ""
+        try:
+            proposal = self._propose(fault)
+        except Exception as e:
+            logger.exception(f"AetherionProposer failed to get a proposal for fault_type={fault.fault_type}")
+            proposal = Proposal(op="escalate", params={}, reasoning=f"AetherionProposer error: {e}")
+        proposal.agent_run_id = self._run_id
+        return proposal
+
+    def approval(self, fault, proposal) -> bool:
+        """Approval hook for Service: True only for the exact proposal the agent's run
+        returned as approved in Slack — never for an escalation or a stale proposal."""
+        return proposal is not None and proposal is self._approved_proposal
+
+    def _agent_params(self, fault):
+        live_status = self.controller.get_status() if self.controller else None
+        fault_duration = self.monitor.fault_duration_seconds() if self.monitor else None
+        recent_history = self.audit.read_recent(n=5, fault_type=fault.fault_type) if self.audit else []
+        params = {
+            "fault": {"fault_type": fault.fault_type, "safetystatus": fault.safetystatus,
+                      "robotmode": fault.robotmode},
+            "recent_history": recent_history,
+        }
+        if live_status:
+            params["live_status"] = {"safetystatus": live_status["safetystatus"],
+                                     "robotmode": live_status["robotmode"]}
+        if fault_duration is not None:
+            params["fault_duration_seconds"] = int(fault_duration)
+        return params
+
+    def _propose(self, fault) -> Proposal:
+        run_id, status, text = self.client.run_agent(self._agent_params(fault))
+        if not run_id or not 200 <= status < 300:
+            return Proposal(op="escalate", params={}, reasoning=f"Aetherion agent did not start ({status}): {text}")
+        self._run_id = run_id
+        logger.info(f"Tier 2 fault {fault.fault_type} sent to Aetherion agent, run_id={run_id}")
+
+        print(f"\n--- Tier 2: sent to the Aetherion agent (run {run_id}) ---")
+        print("Waiting for a person to approve or reject the proposed fix in Slack...")
+        run = self.client.wait_for_run(run_id, timeout_seconds=self.wait_seconds)
+        if run is None:
+            return Proposal(op="escalate", params={},
+                            reasoning=f"no decision from the Aetherion agent within {self.wait_seconds}s "
+                                      f"(run {run_id}); a later Slack reply will not be acted on")
+        if run.get("status") != "COMPLETED":
+            return Proposal(op="escalate", params={},
+                            reasoning=f"Aetherion agent run {run_id} ended {run.get('status')}: "
+                                      f"{(run.get('status_details') or {}).get('message', '')}")
+
+        output = run.get("output_payload") or {}
+        outcome = output.get("status")
+        agent_proposal = output.get("proposal") or output.get("last_proposal") or {}
+        print(f"Agent outcome: {outcome}")
+        if outcome != "approved":
+            reason = output.get("feedback") or agent_proposal.get("reasoning", "")
+            return Proposal(op="escalate", params={}, reasoning=f"agent outcome '{outcome}': {reason}")
+
+        op = agent_proposal.get("op", "")
+        # The agent's own output schema doesn't restrict op to the catalog, so enforce it
+        # here: otherwise a Slack-approved op like power_off would pass Guard's
+        # op_has_controller_support gate just because the controller happens to have it.
+        if op not in AGENT_OP_CATALOG:
+            return Proposal(op="escalate", params={},
+                            reasoning=f"agent proposed '{op}', which is not in the Tier 2 catalog")
+        proposal = Proposal(op=op, params=_clean_params(op, agent_proposal.get("params") or {}),
+                            reasoning=agent_proposal.get("reasoning", ""))
+        self._approved_proposal = proposal
+        return proposal
+
+
 class CompositeProposer:
     """Dispatches to a different proposer per tier. Tier 1 stays on the deterministic
-    DefaultProposer (no API calls, no cost) — only Tier 2 faults reach the LLM."""
+    DefaultProposer (no API calls, no cost) — only Tier 2 faults reach the LLM.
+    Tier 2 defaults to the Aetherion agent; TIER2_BACKEND=local uses AgentProposer
+    (direct OpenAI call + terminal approval) instead."""
 
     def __init__(self, tier1_proposer=None, tier2_proposer=None):
         self.tier1_proposer = tier1_proposer or DefaultProposer()
-        self.tier2_proposer = tier2_proposer or AgentProposer()
+        if tier2_proposer is None:
+            backend = os.environ.get("TIER2_BACKEND", "aetherion")
+            tier2_proposer = AgentProposer() if backend == "local" else AetherionProposer()
+        self.tier2_proposer = tier2_proposer
 
     def propose(self, fault, tier) -> Proposal:
         if tier == 1:

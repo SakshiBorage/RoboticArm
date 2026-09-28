@@ -5,3 +5,4 @@ __pycache__/
 audit_log.jsonl
 service.log
 .env
+logs/

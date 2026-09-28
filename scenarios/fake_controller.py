@@ -51,3 +51,7 @@ class FakeControllerAdapter(ControllerAdapter):
     def notify(self, message):
         self.calls.append(("notify", {"message": message}))
         return True
+
+    def log_message(self, message):
+        self.calls.append(("log_message", {"message": message}))
+        return True

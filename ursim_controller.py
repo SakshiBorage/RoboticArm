@@ -12,6 +12,17 @@ HOST = "127.0.0.1"
 DASHBOARD_PORT = 29999
 SECONDARY_PORT = 30002
 
+# The dashboard server isn't UTF-8 ("—" shows as "???" on the pendant) and a
+# newline would end the command early, so pendant text is kept to plain ASCII.
+_PENDANT_REPLACEMENTS = {"—": "-", "–": "-", "…": "...", "°": " deg", "’": "'", "‘": "'",
+                         "“": '"', "”": '"', "\n": " "}
+
+
+def _pendant_text(message):
+    for char, replacement in _PENDANT_REPLACEMENTS.items():
+        message = message.replace(char, replacement)
+    return message.encode("ascii", "replace").decode("ascii")
+
 
 class URSimController(ControllerAdapter):
     def __init__(self, host=HOST, dashboard_port=DASHBOARD_PORT,
@@ -88,5 +99,21 @@ controller_set_payload()
         # `popup` shows a message box directly on the pendant screen; `addToLog`
         # also writes it into URSim's own Log tab so it's there after the popup
         # is dismissed. Neither has any effect on the robot's actual state.
+        # The popup stays until someone presses OK. PolyScope stacks popups with the
+        # OLDEST on top, and its "close popup" command proved unreliable in URSim
+        # 5.26 (sometimes a no-op), so nothing here tries to close or replace one.
+        message = _pendant_text(message)
         replies = self._dashboard_command(f"popup {message}", f"addToLog {message}")
         return all("fail" not in r.lower() for r in replies)
+
+    def log_message(self, message):
+        reply = self._dashboard_command(f"addToLog {_pendant_text(message)}")[0]
+        return "fail" not in reply.lower()
+
+    def restart_safety(self):
+        """Clear a critical (Tier 3) fault and power back on. Deliberately not a
+        ControllerAdapter op or in any proposal catalog: only a person calls this,
+        after inspecting the arm — nothing in the pipeline can propose it."""
+        self._dashboard_command("close safety popup", "restart safety")
+        time.sleep(3)
+        return self.power_on()

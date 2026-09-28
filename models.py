@@ -15,6 +15,7 @@ class Proposal:
     op: str
     params: dict = field(default_factory=dict)
     reasoning: str = ""  # set by AgentProposer; empty for deterministic proposers
+    agent_run_id: str = ""  # Aetherion run that produced this proposal, for looking it up in the sbox UI
 
 
 @dataclass
@@ -32,5 +33,6 @@ class CycleResult:
     gate_results: list
     decision: str          # "APPROVED" | "DENIED" — Tier 2 blocks on approval() before this is set,
                            # so there's no separate "awaiting" state to represent
+                           # (Tier 3: APPROVED means the halt was allowed, not that anything recovered)
     executed: bool
     execution_error: str = None  # set if decision was APPROVED but _execute() raised
