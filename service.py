@@ -1,0 +1,251 @@
+"""
+Orchestrates one full cycle: fault -> tier -> proposal -> guard -> execute -> audit.
+Tier 3 (critical) skips the proposer entirely: the only proposal is to halt, and
+a person is alerted in Slack to inspect and restart the arm.
+Wired against the real URSimController + SafetyMonitor by default; scenarios/
+inject a FakeControllerAdapter instead so tests don't touch real hardware.
+"""
+import argparse
+import re
+import time
+
+from alerts import send_slack
+from app_logging import get_logger
+from approval import cli_approval
+from audit import AuditLog
+from guard import Guard
+from models import Fault, CycleResult, Proposal
+from monitor import SafetyMonitor
+from preventive import PreventiveMonitor, make_alert_handlers
+from proposer import CompositeProposer
+from router import Router
+from run_logs import RunLog
+from ursim_controller import URSimController
+
+logger = get_logger(__name__)
+
+SAFETYSTATUS_RE = re.compile(r"Safetystatus:\s*(\w+)")
+
+# Plain-language descriptions for the pendant notification — someone watching
+# the arm with no other context shouldn't have to know what "clear_protective_stop" means.
+OP_PLAIN_LANGUAGE = {
+    "clear_protective_stop": "cleared the safety stop",
+    "reset_program_pointer": "restarted the program",
+    "move_joints": "repositioned the arm",
+    "set_payload": "updated the payload setting",
+    "emergency_stop": "stopped the arm immediately",
+    "escalate": "flagged this for a person to review",
+}
+
+
+def fault_from_status(status: dict) -> Fault:
+    match = SAFETYSTATUS_RE.search(status["safetystatus"])
+    fault_type = match.group(1) if match else "UNKNOWN"
+    return Fault(
+        fault_type=fault_type,
+        safetystatus=status["safetystatus"],
+        robotmode=status["robotmode"],
+        detected_at=time.time(),
+    )
+
+
+class Service:
+    def __init__(self, controller=None, monitor=None, router=None, proposer=None,
+                 guard=None, audit=None, approval=None, alerter=None):
+        self.controller = controller or URSimController()
+        self.monitor = monitor or SafetyMonitor(controller=self.controller)
+        self.router = router or Router()
+        self.audit = audit or AuditLog()
+        self.proposer = proposer or CompositeProposer()
+        if isinstance(self.proposer, CompositeProposer):
+            tier2 = self.proposer.tier2_proposer
+            if tier2.controller is None:
+                tier2.controller = self.controller
+            if tier2.monitor is None:
+                tier2.monitor = self.monitor
+            if tier2.audit is None:
+                tier2.audit = self.audit
+        self.guard = guard or Guard()
+        # A Tier 2 proposer that collects its own human approval (the Aetherion agent,
+        # via Slack) supplies the approval hook; otherwise ask at the terminal.
+        tier2_approval = getattr(getattr(self.proposer, "tier2_proposer", None), "approval", None)
+        self.approval = approval or tier2_approval or cli_approval
+        # Tier 3 alerts go straight to a person (Slack); scenarios pass a no-op.
+        self.alerter = alerter or send_slack
+
+    def _execute(self, proposal):
+        return getattr(self.controller, proposal.op)(**proposal.params)
+
+    def _notify_safe(self, message):
+        """Show a message on the pendant for whoever's watching the sim/hardware directly
+        — best-effort, since a failed notification shouldn't take down a real cycle."""
+        try:
+            self.controller.notify(message)
+        except Exception:
+            logger.exception(f"notify() failed for message: {message}")
+
+    def _notify_outcome(self, result: CycleResult):
+        """Fires once, right when the real outcome is known — never before, so the
+        message on the pendant is always synced to something that actually happened,
+        not a "we're thinking about it" placeholder. Plain language, no internal
+        jargon (no "Tier", "gate", op names) — written for someone with zero other
+        context, just watching the arm."""
+        fault_label = result.fault.fault_type.replace("_", " ").title()
+        op_label = OP_PLAIN_LANGUAGE.get(result.proposal.op, result.proposal.op)
+
+        if result.tier == 3:
+            halted = "The arm has been stopped" if result.executed else "Stopping the arm FAILED — stop it manually"
+            message = (f"CRITICAL: {fault_label} ({result.fault.safetystatus}). {halted}. Nothing was fixed "
+                       f"automatically — a person must inspect the arm before it is restarted.")
+        elif result.proposal.op == "escalate":
+            message = (f"{fault_label} happened — no fix was applied; a person needs to check this. "
+                       f"Why: {_shorten(result.proposal.reasoning or 'no safe automatic fix was found')}")
+        elif result.decision == "APPROVED" and result.executed:
+            how = "fixed after a person approved it" if result.tier == 2 else "fixed automatically"
+            message = f"{fault_label} happened — {how}: {op_label}. No action needed."
+        elif result.decision == "APPROVED" and result.execution_error:
+            message = (f"{fault_label} happened — tried to fix it ({op_label}) but that failed: "
+                       f"{result.execution_error}. A person needs to check this.")
+        else:  # DENIED
+            failed = next((g for g in result.gate_results if not g["passed"]), None)
+            reason = failed["reason"] if failed else "unclear reason"
+            message = f"{fault_label} happened — proposed fix was rejected ({reason}). A person needs to check this."
+        self._notify_safe(message)
+
+    def _alert_tier3(self, result: CycleResult):
+        halted = "Arm halted." if result.executed else "Halting the arm FAILED — stop it manually now."
+        text = (f":rotating_light: *CRITICAL fault — Tier 3* :rotating_light:\n"
+                f"Fault: {result.fault.fault_type} ({result.fault.safetystatus}, {result.fault.robotmode})\n"
+                f"{halted} Nothing was fixed automatically.\n"
+                f"A person must inspect the arm on site before it is restarted.")
+        try:
+            return self.alerter(text)
+        except Exception:
+            logger.exception("Tier 3 alert failed")
+            return False
+
+    def run_cycle(self, fault: Fault) -> CycleResult:
+        tier = self.router.assign_tier(fault)
+        if tier == 3:
+            proposal = Proposal(op="emergency_stop", params={},
+                                reasoning="critical fault: halt and wait for a person; no automatic recovery")
+        else:
+            proposal = self.proposer.propose(fault, tier)
+
+        approved_by_human = True
+        if tier == 2:
+            approved_by_human = self.approval(fault, proposal)
+
+        context = {"tier": tier, "fault": fault, "approved": approved_by_human}
+        gate_results, decision = self.guard.evaluate(proposal, context, self.controller)
+        if decision == "DENIED":
+            failed = next((g for g in gate_results if not g["passed"]), None)
+            if failed:
+                logger.info(f"DENIED: fault={fault.fault_type} op={proposal.op} "
+                            f"gate={failed['name']} reason={failed['reason']}")
+
+        executed = False
+        execution_error = None
+        if decision == "APPROVED":
+            try:
+                self._execute(proposal)
+                executed = True
+            except Exception as e:
+                execution_error = str(e)
+                logger.exception(f"Execution failed: fault={fault.fault_type} "
+                                  f"op={proposal.op} params={proposal.params}")
+
+        result = CycleResult(fault, tier, proposal, gate_results, decision, executed, execution_error)
+
+        audit_entry = {
+            "fault_type": result.fault.fault_type,
+            "tier": result.tier,
+            "proposed_op": result.proposal.op,
+            "proposed_params": result.proposal.params,
+            "proposed_reasoning": result.proposal.reasoning,
+            "gate_results": result.gate_results,
+            "decision": result.decision,
+            "executed": result.executed,
+        }
+        if execution_error:
+            audit_entry["execution_error"] = execution_error
+        if proposal.agent_run_id:
+            audit_entry["agent_run_id"] = proposal.agent_run_id
+        if tier == 3:
+            audit_entry["human_alerted"] = self._alert_tier3(result)
+        self.audit.record(audit_entry)
+        self._notify_outcome(result)
+        return result
+
+    def run(self, cycles: int, on_cycle=None, on_event=None):
+        results = []
+        for _ in range(cycles):
+            _, events = self.monitor.poll_once()
+            for event_type, data in events:
+                if event_type == "FAULT_CONFIRMED":
+                    fault = fault_from_status(data)
+                    result = self.run_cycle(fault)
+                    results.append(result)
+                    if on_cycle:
+                        on_cycle(result)
+                elif event_type == "POLL_ERROR":
+                    logger.warning(f"Monitor poll error: {data.get('error')}")
+                    if on_event:
+                        on_event(event_type, data)
+                elif event_type == "STUCK":
+                    logger.warning(f"Fault stuck for {data.get('duration_s', 0):.1f}s: {data}")
+                    if on_event:
+                        on_event(event_type, data)
+                elif event_type == "RECOVERED":
+                    if on_event:
+                        on_event(event_type, data)
+            time.sleep(self.monitor.poll_interval)
+        return results
+
+
+def _shorten(text, limit=160):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("--cycles", type=int, default=60)
+    run_parser.add_argument("--preventive-interval", type=float, default=5.0,
+                            help="seconds between preventive health checks (0 to turn them off)")
+    args = parser.parse_args()
+
+    if args.command == "run":
+        run_log = RunLog("service")
+        controller = URSimController()
+        service = Service(controller=controller, audit=AuditLog(copy_to=run_log.audit_path))
+        print(f"Logs for this run: {run_log.dir}")
+        preventive = None
+        if args.preventive_interval > 0:
+            on_warning, on_clear = make_alert_handlers(controller, run_log)
+            preventive = PreventiveMonitor(interval_s=args.preventive_interval,
+                                           on_warning=on_warning, on_clear=on_clear).start()
+
+        def report(result):
+            print(f"[{result.tier=} {result.proposal.op=} {result.decision=} {result.executed=}]")
+            if result.decision == "DENIED":
+                failed = next((g for g in result.gate_results if not g["passed"]), None)
+                if failed:
+                    print(f"    denied by gate '{failed['name']}': {failed['reason']}")
+            if result.execution_error:
+                print(f"    EXECUTION ERROR: {result.execution_error}")
+
+        def report_event(event_type, data):
+            print(f"[EVENT {event_type}] {data}")
+            run_log.event(event_type.lower(), **data)
+
+        try:
+            service.run(cycles=args.cycles, on_cycle=report, on_event=report_event)
+        finally:
+            if preventive:
+                preventive.stop()
+
+
+if __name__ == "__main__":
+    main()
