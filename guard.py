@@ -8,9 +8,8 @@ not a recovery of the "12 gates" figure mentioned in earlier project notes,
 which belonged to a harness that isn't present in this codebase. Extend as
 real gaps surface.
 
-Current scope is Tier 1 only (see progress.md decision: a denied Tier 1
-proposal dead-ends as escalate-only, it does not auto-reroute to Tier 2).
-Tier 2's approval gate is a stub until that tier gets built out.
+A denied Tier 1 proposal dead-ends as escalate-only, it does not auto-reroute
+to Tier 2 (see progress.md). Tier 2 needs human approval; Tier 3 may only halt.
 """
 import math
 
@@ -19,6 +18,10 @@ import math
 # loss telemetry — not simulable in URSim) is deliberately excluded: it will
 # fail op_has_controller_support below if ever proposed.
 TIER1_WHITELIST = {"clear_protective_stop", "reset_program_pointer", "set_payload"}
+
+# Tier 3 (critical) never recovers anything automatically — halting is the only
+# action allowed; restarting is left to a person.
+TIER3_ALLOWED_OPS = {"emergency_stop"}
 
 PARAM_BOUNDS = {
     "set_payload": lambda params: 0 <= params.get("mass_kg", 0) <= 5.0,
@@ -53,6 +56,10 @@ class Guard:
         elif tier == 2:
             if not gate("tier2_approval", context.get("approved", False),
                          "Tier 2 proposal has not been human-approved"):
+                return gate_results, "DENIED"
+        elif tier == 3:
+            if not gate("tier3_halt_only", proposal.op in TIER3_ALLOWED_OPS,
+                         f"Tier 3 only allows halting, not '{proposal.op}'"):
                 return gate_results, "DENIED"
 
         bounds_check = PARAM_BOUNDS.get(proposal.op)

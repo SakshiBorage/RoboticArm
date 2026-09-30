@@ -34,3 +34,13 @@ def _configure():
 def get_logger(name):
     _configure()
     return logging.getLogger(f"factory_arm.{name}")
+
+
+def add_log_file(path):
+    """Also write full detail to path — used by run_logs.RunLog so each run keeps
+    its own copy of the log alongside the shared service.log."""
+    _configure()
+    handler = logging.FileHandler(path)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s"))
+    logging.getLogger("factory_arm").addHandler(handler)

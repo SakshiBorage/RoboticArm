@@ -31,10 +31,27 @@ service.py (Service.run_cycle)
        +--> audit.py     -> write down exactly what happened
 ```
 
-Tier 1 is a small, deliberately-scoped set of whitelisted recovery ops
-(`clear_protective_stop`, `reset_program_pointer`, `set_payload`). Anything else
-routes to Tier 2, which is currently a stub (logs `AWAITING_APPROVAL`, nothing
-more) — Tier 1 is the current focus.
+Three tiers, assigned by `router.py` from the fault alone:
+
+- **Tier 1** — known faults with a whitelisted recovery (`clear_protective_stop`,
+  `reset_program_pointer`, `set_payload`): fixed automatically.
+- **Tier 2** — anything unrecognized: the `factory_arm_agent` on Aetherion sbox
+  proposes one fix and a person approves/rejects it in Slack
+  (`aetherion_client.py`, `AetherionProposer`). `TIER2_BACKEND=local` uses a
+  direct OpenAI call + terminal prompt instead.
+- **Tier 3** — critical safety states (`FAULT`, `VIOLATION`, emergency stops,
+  unparseable status): the arm is halted, a person is alerted in Slack, and
+  nothing is recovered automatically — only a person restarts it.
+
+Alongside the tiers, `preventive.py` reads live telemetry (RTDE, port 30004)
+every few seconds and warns — terminal, pendant, Slack — when something is
+drifting toward a limit (joint end stops, TCP speed, joint temperature and its
+trend, supply voltage). It never moves or stops the arm.
+
+Every run of `demo.py` / `service.py run` keeps its own logs in
+`logs/<timestamp>_<demo|service>/` (`service.log`, `audit.jsonl`,
+`events.jsonl`) — see `run_logs.py`. The folder is git-ignored and never
+cleaned up automatically.
 
 ## Setup
 
@@ -59,8 +76,8 @@ docker rm ursim
 
 ## Running things
 
-**Live demo** (watch a real move -> fault -> autonomous recovery -> confirmed
-working-again move, on the pendant):
+**Live demo** (baseline job, then a preventive early warning, then one fault per
+tier — Tier 2 waits for your reply in Slack, Tier 3 waits for you to press Enter):
 ```bash
 source venv/bin/activate
 python3 demo.py
@@ -98,7 +115,11 @@ tail -f audit_log.jsonl
 | `guard.py` | The only thing that can deny a proposal — runs a fixed gate checklist |
 | `audit.py` | Appends one JSON line per cycle to `audit_log.jsonl` |
 | `service.py` | Wires fault -> tier -> proposal -> guard -> execute -> audit; CLI entry point |
-| `demo.py` | Watchable end-to-end demo against the real URSim pendant |
+| `demo.py` | Watchable end-to-end demo against the real URSim pendant (all 3 tiers + preventive check) |
+| `aetherion_client.py` | Starts the Tier 2 agent on Aetherion sbox and polls its result (HTTP, no SDK) |
+| `alerts.py` | Direct Slack alerts for Tier 3 and preventive warnings |
+| `preventive.py` | Periodic warn-only health checks from RTDE telemetry |
+| `run_logs.py` | Per-run log folders under `logs/` |
 | `scenarios/` | In-memory fake controller + regression suite, no real hardware needed |
 | `ursim_power.py`, `ursim_basic_move.py`, `ursim_check_status.py`, `ursim_trigger_fault*.py` | Early standalone exploration scripts (pre-adapter) |
 

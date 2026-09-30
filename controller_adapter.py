@@ -43,3 +43,8 @@ class ControllerAdapter(ABC):
     def notify(self, message: str) -> bool:
         """Show a message where someone watching the physical/simulated pendant can see
         it — no safety effect, purely informational (fault detected, fix applied, etc.)."""
+
+    def log_message(self, message: str) -> bool:
+        """Record a message in the controller's own log without a popup (early warnings).
+        Optional — controllers without a log just don't record it."""
+        return False
